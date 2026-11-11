@@ -1,0 +1,68 @@
+--- diagnostic_trace.h
++++ diagnostic_trace.h
+@@ -14,6 +14,8 @@
+ 
+ namespace colmap { namespace diagnostic_trace {
+ bool Enabled();
++void EndBootstrapProbe();
++void RecordBootstrapObservations(const Reconstruction& rec);
+ bool StopRequested();
+ void SetImage(image_t image);
+ image_t CurrentImage();
+@@ -88,6 +90,10 @@
+ }
+ bool Enabled(){return !Get().root.empty();}
+ bool StopRequested(){return Enabled() && Get().stop;}
++void EndBootstrapProbe() {
++  Get().stop = true;
++  Get().reason = "bootstrap_probe_complete";
++}
+ void SetImage(image_t image){Get().image=image;}
+ image_t CurrentImage(){return Get().image;}
+ std::filesystem::path NextFile(const std::string& kind,const std::string& ext) {
+@@ -118,7 +124,10 @@
+ void Capture(const std::string& stage,const Reconstruction& rec,bool full) {
+   if(!Enabled())return;
+   const bool initial=rec.NumRegFrames()==2 && (stage=="after_initial_pair_registration" || stage=="before_global_BA_solve" || stage=="after_global_BA_solve" || stage=="after_global_normalize");
+-  const bool boundary=initial || stage=="resumed_initial" || stage=="before_registration_trial" || stage=="after_registration" || stage=="after_local_refinement" || stage=="before_global_pipeline" || stage=="after_global_pipeline";
++  const bool probe_snapshot = rec.NumRegFrames() == 3 &&
++      (stage == "after_registration" || stage.rfind("probe_", 0) == 0);
++  if (probe_snapshot && stage == "after_registration") RecordBootstrapObservations(rec);
++  const bool boundary=probe_snapshot || initial || stage=="resumed_initial" || stage=="before_registration_trial" || stage=="after_registration" || stage=="after_local_refinement" || stage=="before_global_pipeline" || stage=="after_global_pipeline";
+   if(!boundary)return;
+   auto& s=Get();const auto path=NextFile(stage,"json");
+   struct Row {int a,b;size_t checked=0,bad=0;};
+@@ -174,7 +183,7 @@
+   }
+   // First completed global checkpoint only; final CLI model is written separately.
+   const bool initial_full=initial && s.initial_snapshots<6;
+-  full=full && (initial_full || (stage=="after_global_pipeline" && s.completed_globals==1) || s.stop);
++  full=full && (probe_snapshot || initial_full || (stage=="after_global_pipeline" && s.completed_globals==1) || s.stop);
+   if(full && initial_full)++s.initial_snapshots;
+   std::string model;
+   if(full) {
+--- incremental_mapper.cc
++++ incremental_mapper.cc
+@@ -44,6 +44,13 @@
+ #include "colmap/util/hash_containers.h"
+ 
+ #include <array>
++#include "bootstrap_probe.h"
++
++namespace colmap::diagnostic_trace {
++void RecordBootstrapObservations(const Reconstruction& rec) {
++  bootstrap_probe::RecordRegistered(rec);
++}
++}  // namespace colmap::diagnostic_trace
+ 
+ namespace colmap {
+ namespace {
+@@ -1128,7 +1135,7 @@
+     auto bundle_adjuster =
+         CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
+     diagnostic_trace::Capture("before_local_BA",*reconstruction_);
+-    const auto summary = bundle_adjuster->Solve();
++    const auto summary = bootstrap_probe::Solve(*bundle_adjuster, *reconstruction_);
+     diagnostic_trace::Capture("after_local_BA_before_tracks",*reconstruction_);
+ 
+     report.num_adjusted_observations = summary->num_residuals / 2;

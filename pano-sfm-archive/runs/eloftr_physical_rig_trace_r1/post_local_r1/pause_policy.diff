@@ -1,0 +1,12 @@
+--- 
++++ 
+@@ -140,7 +140,8 @@
+   for(const auto& p:groups)if(p.second.bad>=4)strong.insert(p.first);
+   if(!s.initialized) {s.baseline_bad=strong;s.initialized=true;
+     if(!strong.empty()){s.stop=true;s.reason="baseline_conflict";}}
+-  for(const auto& p:strong)if(!s.baseline_bad.count(p)) {s.stop=true;s.reason="new_signed_translation_conflict";}
++  for(const auto& p:strong)if(!s.baseline_bad.count(p) && stage=="after_local_refinement") {s.stop=true;s.reason="persisting_signed_translation_conflict";}
++  if(stage=="after_local_refinement" && rec.NumRegFrames()>=429) {s.stop=true;if(s.reason.empty())s.reason="post_local_boundary";}
+   if(rec.NumRegFrames()>=s.max_frames && !s.stop) {s.stop=true;s.reason="bounded_frame_limit";}
+   if(full && s.snapshots>=s.max_snapshots) {full=false;s.stop=true;s.reason="snapshot_budget";}
+   if(std::filesystem::space(s.root).available<120ull*1024*1024*1024) {

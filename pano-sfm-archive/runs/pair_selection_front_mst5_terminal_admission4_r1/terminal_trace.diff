@@ -1,0 +1,11 @@
+--- /scratch/pano-sfm/work/runs/pair_selection_front_mst5_terminal_r1/private_sources/terminal_trace.h
++++ /output/private_sources/terminal_trace.h
+@@ -35,7 +35,7 @@
+   // Reserve space before every full model. Bounds are separate from mapper logic.
+   constexpr uintmax_t max_next_model = 1 * gib;
+   if (std::filesystem::space(state.root).available < 100 * gib + max_next_model ||
+-      state.written_bytes + max_next_model > 10 * gib) {
++      state.written_bytes + max_next_model > 18 * gib) {
+     throw std::runtime_error("terminal checkpoint disk budget reached");
+   }
+   std::ostringstream label;

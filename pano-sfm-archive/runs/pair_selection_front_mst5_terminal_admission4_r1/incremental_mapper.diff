@@ -1,0 +1,36 @@
+--- /scratch/pano-sfm/work/runs/pair_selection_front_mst5_terminal_r1/private_sources/incremental_mapper.cc
++++ /output/private_sources/incremental_mapper.cc
+@@ -31,6 +31,7 @@
+ #define COLMAP_DIAGNOSTIC_TRACE_IMPLEMENTATION
+ #include "colmap/sfm/diagnostic_trace.h"
+ #include "terminal_trace.h"
++#include "terminal_admission.h"
+ 
+ #include "colmap/estimators/bundle_adjustment.h"
+ #include "colmap/estimators/bundle_adjustment_ceres.h"
+@@ -1365,10 +1366,14 @@
+   }
+   diagnostic_trace::Capture("before_global_complete_merge",*reconstruction_);
+   terminal_trace::Capture("before_global_complete_merge",*reconstruction_);
++  const auto before_complete = terminal_admission::Before(*reconstruction_);
+   CompleteAndMergeTracks(tri_options);
++  terminal_admission::Apply("initial_complete_merge", before_complete, *reconstruction_, *obs_manager_, *triangulator_);
+   diagnostic_trace::Capture("after_global_complete_merge",*reconstruction_);
+   terminal_trace::Capture("after_global_complete_merge",*reconstruction_);
++  const auto before_retriangulate = terminal_admission::Before(*reconstruction_);
+   const size_t num_retriangulated_observations = Retriangulate(tri_options);
++  terminal_admission::Apply("retriangulate", before_retriangulate, *reconstruction_, *obs_manager_, *triangulator_);
+   diagnostic_trace::Capture("after_global_retriangulate",*reconstruction_);
+   terminal_trace::Capture("after_global_retriangulate",*reconstruction_);
+   VLOG(1) << "=> Retriangulated observations: "
+@@ -1396,7 +1401,10 @@
+         transform << std::setprecision(17) << normalization.ToMatrix() << '\n';
+       }
+     }
++    const auto before_postsolve = terminal_admission::Before(*reconstruction_);
+     size_t num_changed_observations = CompleteAndMergeTracks(tri_options);
++    num_changed_observations += terminal_admission::Apply(
++        "postsolve_complete_merge", before_postsolve, *reconstruction_, *obs_manager_, *triangulator_);
+     diagnostic_trace::Capture("after_global_postsolve_tracks",*reconstruction_);
+     terminal_trace::Capture("after_global_postsolve_tracks",*reconstruction_);
+     num_changed_observations += FilterPoints(options);

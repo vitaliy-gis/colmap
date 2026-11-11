@@ -1,0 +1,102 @@
+--- sfm/incremental_mapper.cc
++++ sfm/incremental_mapper.cc
+@@ -28,6 +28,8 @@
+ // POSSIBILITY OF SUCH DAMAGE.
+ 
+ #include "colmap/sfm/incremental_mapper.h"
++#define COLMAP_DIAGNOSTIC_TRACE_IMPLEMENTATION
++#include "colmap/sfm/diagnostic_trace.h"
+ 
+ #include "colmap/estimators/bundle_adjustment.h"
+ #include "colmap/estimators/bundle_adjustment_ceres.h"
+@@ -130,6 +132,7 @@
+   filtered_frames_.clear();
+   reg_stats_.num_reg_trials.clear();
+   reg_stats_.num_structure_less_reg_trials.clear();
++  for(const auto& entry : diagnostic_trace::PriorTrials()) reg_stats_.num_reg_trials[entry.first]=entry.second;
+ }
+ 
+ void IncrementalMapper::EndReconstruction(const bool discard) {
+@@ -605,6 +608,7 @@
+   size_t num_inliers;
+   std::vector<char> inlier_mask;
+   Rigid3d rig_from_world;
++  diagnostic_trace::PnP("pnp_input",tri_corrs,tri_points2D,tri_points3D,tri_camera_idxs,cams_from_rig,inlier_mask,nullptr);
+   if (!EstimateGeneralizedAbsolutePose(abs_pose_options,
+                                        tri_points2D,
+                                        tri_points3D,
+@@ -628,6 +632,7 @@
+   // Pose refinement
+   //////////////////////////////////////////////////////////////////////////////
+ 
++  diagnostic_trace::PnP("pnp_estimated",tri_corrs,tri_points2D,tri_points3D,tri_camera_idxs,cams_from_rig,inlier_mask,&rig_from_world);
+   if (!RefineGeneralizedAbsolutePose(abs_pose_refinement_options,
+                                      inlier_mask,
+                                      tri_points2D,
+@@ -647,6 +652,7 @@
+   VLOG(2) << "Continuing tracks for " << num_inliers
+           << " inlier 2D-3D correspondences";
+ 
++  diagnostic_trace::PnP("pnp_refined",tri_corrs,tri_points2D,tri_points3D,tri_camera_idxs,cams_from_rig,inlier_mask,&rig_from_world);
+   frame.SetRigFromWorld(rig_from_world);
+ 
+   obs_manager_->RegisterFrame(frame.FrameId());
+@@ -1084,7 +1090,9 @@
+ 
+     auto bundle_adjuster =
+         CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
++    diagnostic_trace::Capture("before_local_BA",*reconstruction_);
+     const auto summary = bundle_adjuster->Solve();
++    diagnostic_trace::Capture("after_local_BA_before_tracks",*reconstruction_);
+ 
+     report.num_adjusted_observations = summary->num_residuals / 2;
+ 
+@@ -1138,7 +1146,9 @@
+   }
+ 
+   // Avoid degeneracies in bundle adjustment.
++  diagnostic_trace::Capture("before_negative_depth_filter",*reconstruction_);
+   obs_manager_->FilterObservationsWithNegativeDepth();
++  diagnostic_trace::Capture("after_negative_depth_filter",*reconstruction_);
+ 
+   // Configure bundle adjustment.
+   BundleAdjustmentConfig ba_config;
+@@ -1249,7 +1259,10 @@
+         CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
+   }
+ 
+-  return bundle_adjuster->Solve()->IsSolutionUsable();
++  diagnostic_trace::Capture("before_global_BA_solve",*reconstruction_);
++  const bool trace_usable=bundle_adjuster->Solve()->IsSolutionUsable();
++  diagnostic_trace::Capture("after_global_BA_solve",*reconstruction_);
++  return trace_usable;
+ }
+ 
+ void IncrementalMapper::IterativeLocalRefinement(
+@@ -1304,8 +1317,11 @@
+   if (ba_options.check_if_stopped && ba_options.check_if_stopped()) {
+     return;
+   }
++  diagnostic_trace::Capture("before_global_complete_merge",*reconstruction_);
+   CompleteAndMergeTracks(tri_options);
++  diagnostic_trace::Capture("after_global_complete_merge",*reconstruction_);
+   const size_t num_retriangulated_observations = Retriangulate(tri_options);
++  diagnostic_trace::Capture("after_global_retriangulate",*reconstruction_);
+   VLOG(1) << "=> Retriangulated observations: "
+           << num_retriangulated_observations;
+   for (int i = 0; i < max_num_refinements; ++i) {
+@@ -1320,10 +1336,14 @@
+     if (normalize_reconstruction && !options.use_prior_position) {
+       // Normalize scene for numerical stability and
+       // to avoid large scale changes in the viewer.
++      diagnostic_trace::Capture("before_global_normalize",*reconstruction_);
+       reconstruction_->Normalize();
++      diagnostic_trace::Capture("after_global_normalize",*reconstruction_);
+     }
+     size_t num_changed_observations = CompleteAndMergeTracks(tri_options);
++    diagnostic_trace::Capture("after_global_postsolve_tracks",*reconstruction_);
+     num_changed_observations += FilterPoints(options);
++    diagnostic_trace::Capture("after_global_point_filter",*reconstruction_);
+     const double changed =
+         num_observations == 0
+             ? 0

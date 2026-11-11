@@ -1,0 +1,264 @@
+--- native/incremental_mapper_impl.cc
++++ guarded/incremental_mapper_impl.cc
+@@ -1,3 +1,12 @@
++#include <Eigen/QR>
++#include <array>
++#include <limits>
++#include <set>
++#include <stdexcept>
++#include <tuple>
++#include <cstdlib>
++#include <fstream>
++#include <iomanip>
+ // Copyright (c), ETH Zurich and UNC Chapel Hill.
+ // All rights reserved.
+ //
+@@ -538,6 +547,144 @@
+ 
+ namespace {
+ 
++// This guard applies only to the fixed, noncentral rig initialization.
++struct MetricRay {
++  Eigen::Vector3d center;
++  Eigen::Vector3d ray;
++  Eigen::Matrix<double, 3, 2> jacobian;
++};
++
++using MetricMatch = std::pair<MetricRay, MetricRay>;
++
++double MetricResidual(const MetricMatch& match,
++                      const Eigen::Matrix3d& rotation,
++                      const Eigen::Vector3d& translation) {
++  const auto& [a, b] = match;
++  const Eigen::Vector3d u = rotation * a.ray;
++  const Eigen::Vector3d offset = rotation * a.center + translation - b.center;
++  const Eigen::Vector2d d1 =
++      (rotation * a.jacobian).transpose() * b.ray.cross(offset);
++  const Eigen::Vector2d d2 = b.jacobian.transpose() * offset.cross(u);
++  return u.cross(b.ray).dot(offset) /
++         std::sqrt(d1.squaredNorm() + d2.squaredNorm());
++}
++
++double MetricLogScaleSigma(const std::vector<MetricMatch>& matches,
++                           const Eigen::Matrix3d& rotation,
++                           const Eigen::Vector3d& translation) {
++  const double infinity = std::numeric_limits<double>::infinity();
++  if (matches.size() <= 6 || !translation.allFinite() ||
++      translation.norm() <= 0 || !rotation.allFinite()) {
++    return infinity;
++  }
++  const Eigen::Vector3d axis1 = translation.normalized().unitOrthogonal();
++  const Eigen::Vector3d axis2 = translation.normalized().cross(axis1);
++  const std::array<Eigen::Vector3d, 2> axes{axis1, axis2};
++  Eigen::Matrix<double, Eigen::Dynamic, 5> nuisance(matches.size(), 5);
++  Eigen::VectorXd scale(matches.size());
++  Eigen::VectorXd residuals(matches.size());
++  constexpr double h = 1e-5;
++  for (size_t row = 0; row < matches.size(); ++row) {
++    const MetricMatch& match = matches[row];
++    residuals(row) = MetricResidual(match, rotation, translation);
++    for (int i = 0; i < 3; ++i) {
++      const Eigen::Vector3d axis = Eigen::Vector3d::Unit(i);
++      nuisance(row, i) =
++          (MetricResidual(match, Eigen::AngleAxisd(h, axis) * rotation, translation) -
++           MetricResidual(match, Eigen::AngleAxisd(-h, axis) * rotation, translation)) /
++          (2 * h);
++    }
++    for (int i = 0; i < 2; ++i) {
++      nuisance(row, 3 + i) =
++          (MetricResidual(match, rotation, Eigen::AngleAxisd(h, axes[i]) * translation) -
++           MetricResidual(match, rotation, Eigen::AngleAxisd(-h, axes[i]) * translation)) /
++          (2 * h);
++    }
++    scale(row) =
++        (MetricResidual(match, rotation, std::exp(h) * translation) -
++         MetricResidual(match, rotation, std::exp(-h) * translation)) / (2 * h);
++  }
++  if (!nuisance.allFinite() || !scale.allFinite() || !residuals.allFinite()) {
++    return infinity;
++  }
++  const auto qr = nuisance.colPivHouseholderQr();
++  if (qr.rank() != 5) {
++    return infinity;
++  }
++  const double information = (scale - nuisance * qr.solve(scale)).norm();
++  const double noise = std::max(
++      1.0, residuals.norm() / std::sqrt(double(matches.size() - 6)));
++  return information > 0 ? noise / information : infinity;
++}
++
++bool MetricScaleIsObservable(double sigma) {
++  // Under the local linearized noise model, a 95% interval must distinguish
++  // the estimated translation length from half or twice that length.
++  return 1.96 * sigma < std::log(2.0);
++}
++
++double CheckMetricInitScale(
++    const std::vector<Eigen::Vector2d>& pixels1,
++    const std::vector<Eigen::Vector2d>& pixels2,
++    const std::vector<size_t>& idx1,
++    const std::vector<size_t>& idx2,
++    const std::vector<Rigid3d>& cam_from_rig,
++    const std::vector<Camera>& cameras,
++    const std::vector<char>& inliers,
++    const Rigid3d& pose) {
++  std::vector<MetricMatch> matches;
++  matches.reserve(inliers.size());
++  std::set<std::tuple<size_t, double, double>> seen1, seen2;
++  for (size_t i = 0; i < inliers.size(); ++i) {
++    if (!inliers[i]) continue;
++    const auto a = cameras[idx1[i]].CamRayFromImgWithJac(pixels1[i]);
++    const auto b = cameras[idx2[i]].CamRayFromImgWithJac(pixels2[i]);
++    if (!a || !b) continue;
++    const auto key1 = std::make_tuple(idx1[i], pixels1[i].x(), pixels1[i].y());
++    const auto key2 = std::make_tuple(idx2[i], pixels2[i].x(), pixels2[i].y());
++    if (seen1.count(key1) || seen2.count(key2)) continue;
++    seen1.insert(key1);
++    seen2.insert(key2);
++    const Rigid3d& ca = cam_from_rig[idx1[i]];
++    const Rigid3d& cb = cam_from_rig[idx2[i]];
++    const Eigen::Matrix3d ra = ca.rotation().inverse().toRotationMatrix();
++    const Eigen::Matrix3d rb = cb.rotation().inverse().toRotationMatrix();
++    matches.push_back({{ca.TgtOriginInSrc(), ra * a->ray, ra * a->jacobian},
++                       {cb.TgtOriginInSrc(), rb * b->ray, rb * b->jacobian}});
++  }
++  return MetricLogScaleSigma(
++      matches, pose.rotation().toRotationMatrix(), pose.translation());
++}
++void TestMetricGate() {
++  const Eigen::Matrix3d rotation =
++      Eigen::AngleAxisd(0.09, Eigen::Vector3d::UnitY()).toRotationMatrix();
++  const Eigen::Vector3d translation(1.8, 0.3, 0.4);
++  auto ray = [](const Eigen::Vector3d& point, const Eigen::Vector3d& center) {
++    const Eigen::Vector3d unit = (point - center).normalized();
++    Eigen::Matrix<double, 3, 2> jac =
++        -unit * unit.head<2>().transpose();
++    jac.topRows<2>().diagonal().array() += 1;
++    jac *= unit.z() / 1000.0;
++    return MetricRay{center, unit, jac};
++  };
++  for (bool noncentral : {true, false}) {
++    std::vector<MetricMatch> matches;
++    for (int i = 0; i < 240; ++i) {
++      const Eigen::Vector3d point(3 * std::sin(i * 0.53),
++                                  2 * std::cos(i * 0.31),
++                                  5 + i % 17);
++      const Eigen::Vector3d ca((i % 2) * noncentral, 0, 0);
++      const Eigen::Vector3d cb(((i / 2) % 2) * noncentral, 0, 0);
++      matches.emplace_back(ray(point, ca), ray(rotation * point + translation, cb));
++    }
++    const double sigma = MetricLogScaleSigma(matches, rotation, translation);
++    LOG(INFO) << "Synthetic noncentral " << noncentral << " log-scale sigma " << sigma;
++    if (MetricScaleIsObservable(sigma) != noncentral) {
++      throw std::runtime_error("Unexpected synthetic metric gate result");
++    }
++  }
++}
++
+ bool EstimateInitialGeneralizedTwoViewGeometry(
+     const IncrementalMapper::Options& options,
+     const DatabaseCache& database_cache,
+@@ -616,6 +763,36 @@
+     return false;
+   }
+ 
++
++  if (const char* probe = std::getenv("AAM_INIT_PROBE")) {
++    std::ofstream summary(std::string(probe) + "/generalized.txt");
++    summary << std::setprecision(17)
++            << maybe_rig2_from_rig1.has_value() << ' '
++            << maybe_pano2_from_pano1.has_value() << ' '
++            << num_inliers << ' ' << points2D1.size() << ' '
++            << options.init_max_error << '\n';
++    if (maybe_rig2_from_rig1) summary << maybe_rig2_from_rig1->ToMatrix() << '\n';
++    if (maybe_pano2_from_pano1) summary << maybe_pano2_from_pano1->ToMatrix() << '\n';
++    std::ofstream rows(std::string(probe) + "/rows.tsv");
++    rows << std::setprecision(17);
++    for (size_t i = 0; i < points2D1.size(); ++i) {
++      rows << camera_idxs1[i] << '\t' << camera_idxs2[i] << '\t'
++           << points2D1[i].x() << '\t' << points2D1[i].y() << '\t'
++           << points2D2[i].x() << '\t' << points2D2[i].y() << '\t'
++           << int(inlier_mask[i]) << '\n';
++    }
++    std::ofstream calibration(std::string(probe) + "/cameras.tsv");
++    calibration << std::setprecision(17);
++    for (size_t i = 0; i < cameras.size(); ++i) {
++      calibration << cameras[i].camera_id;
++      for (double v : cameras[i].params) calibration << '\t' << v;
++      const auto m = cams_from_rig[i].ToMatrix();
++      for (int row = 0; row < m.rows(); ++row) {
++        for (int col = 0; col < m.cols(); ++col) calibration << '\t' << m(row, col);
++      }
++      calibration << '\n';
++    }
++  }
+   VLOG(3) << "Initial general frame pair with " << num_inliers
+           << " inlier matches";
+ 
+@@ -629,6 +806,31 @@
+                                      ? maybe_rig2_from_rig1.value()
+                                      : maybe_pano2_from_pano1.value();
+ 
++  const Eigen::Vector3d first_center = cams_from_rig.front().TgtOriginInSrc();
++  const bool noncentral = std::any_of(
++      cams_from_rig.begin(), cams_from_rig.end(), [&](const Rigid3d& camera) {
++        return !camera.TgtOriginInSrc().isApprox(first_center, 1e-6);
++      });
++  if (noncentral) {
++    const double sigma = maybe_rig2_from_rig1
++                             ? CheckMetricInitScale(points2D1,
++                                                    points2D2,
++                                                    camera_idxs1,
++                                                    camera_idxs2,
++                                                    cams_from_rig,
++                                                    cameras,
++                                                    inlier_mask,
++                                                    rig2_from_rig1)
++                             : std::numeric_limits<double>::infinity();
++    const bool accepted = MetricScaleIsObservable(sigma);
++    LOG(INFO) << "Metric rig initialization " << (accepted ? "accepted" : "rejected")
++              << " images " << orig_image1.ImageId() << " " << orig_image2.ImageId()
++              << " log-scale sigma " << sigma
++              << " rig translation " << rig2_from_rig1.translation().norm()
++              << " inliers " << num_inliers;
++    if (!accepted) return false;
++  }
++
+   // Recompose the relative transformation between the original images.
+ 
+   const sensor_t orig_camera_id1(SensorType::CAMERA, orig_image1.CameraId());
+@@ -646,10 +848,19 @@
+   orig_cam2_from_orig_cam1 =
+       orig_cam2_from_rig2 * rig2_from_rig1 * Inverse(orig_cam1_from_rig1);
+ 
++  if (const char* probe = std::getenv("AAM_INIT_PROBE")) {
++    std::ofstream out(std::string(probe) + "/composition.txt");
++    out << std::setprecision(17) << orig_cam1_from_rig1.ToMatrix() << '\n'
++        << orig_cam2_from_rig2.ToMatrix() << '\n'
++        << orig_cam2_from_orig_cam1.ToMatrix() << '\n';
++  }
++
+   return true;
+ }
+ 
+ }  // namespace
++
++void RunMetricGateSyntheticTests() { TestMetricGate(); }
+ 
+ std::optional<IncrementalMapperImpl::InitInfo>
+ IncrementalMapperImpl::EstimateInitialTwoViewGeometry(
+@@ -693,6 +904,14 @@
+     return std::nullopt;
+   }
+ 
++
++  if (const char* probe = std::getenv("AAM_INIT_PROBE")) {
++    std::ofstream central(std::string(probe) + "/central.txt");
++    central << std::setprecision(17) << two_view_geometry.config << ' '
++            << two_view_geometry.inlier_matches.size() << ' '
++            << two_view_geometry.tri_angle << '\n'
++            << two_view_geometry.cam2_from_cam1->ToMatrix() << '\n';
++  }
+   VLOG(3) << "Initial image pair with config " << two_view_geometry.config
+           << ", " << two_view_geometry.inlier_matches.size()
+           << " inlier matches, "

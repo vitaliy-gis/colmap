@@ -1,0 +1,53 @@
+--- /opt/colmap421/src/colmap/sfm/incremental_mapper.cc
++++ private/incremental_mapper.cc
+@@ -37,6 +37,9 @@
+ #include "colmap/estimators/pose.h"
+ #include "colmap/estimators/triangulation.h"
+ #include "colmap/scene/reconstruction_pruning.h"
++#include "colmap/scene/correspondence_graph.h"
++#include <algorithm>
++#include <cmath>
+ #include "colmap/sfm/incremental_mapper_impl.h"
+ #include "colmap/util/hash_containers.h"
+ 
+@@ -184,7 +187,7 @@
+ 
+ std::vector<image_t> IncrementalMapper::FindNextImages(const Options& options,
+                                                        bool structure_less) {
+-  return IncrementalMapperImpl::FindNextImages(
++  auto candidates = IncrementalMapperImpl::FindNextImages(
+       options,
+       *obs_manager_,
+       filtered_frames_,
+@@ -192,6 +195,31 @@
+       structure_less ? reg_stats_.num_structure_less_reg_trials
+                      : reg_stats_.num_reg_trials,
+       /*structure_less=*/structure_less);
++  if (structure_less) return candidates;
++  const auto& graph = *database_cache_->CorrespondenceGraph();
++  const auto& rec = *reconstruction_;
++  std::map<image_t,double> scores;
++  std::ofstream log(diagnostic_trace::NextFile("aam_ranking","csv"));
++  log << std::setprecision(17) << "native_rank,image_id,name,max_aam,best_source\n";
++  for(size_t rank=0;rank<candidates.size();++rank) {
++    const auto id=candidates[rank];const auto& im=rec.Image(id);
++    std::map<image_t,double> by_source;
++    for(point2D_t k=0;k<im.NumPoints2D();++k) {
++      auto a=graph.FindCorrespondences(id,k);
++      for(auto c=a.beg;c<a.end;++c) {
++        const auto& si=rec.Image(c->image_id);if(!si.HasPose())continue;
++        auto b=graph.FindCorrespondences(c->image_id,c->point2D_idx);
++        const size_t degree=im.Name()<si.Name()?size_t(a.end-a.beg):size_t(b.end-b.beg);
++        by_source[c->image_id]+=std::pow(.5,double(degree)-1);
++      }
++    }
++    float best=1e30;image_t best_source=kInvalidImageId;
++    for(auto [sid,v]:by_source){float delta=float(1/(v+1e-6));if(delta<best){best=delta;best_source=sid;}}
++    scores[id]=1.0/best;
++    log<<rank<<','<<id<<','<<im.Name()<<','<<scores[id]<<','<<best_source<<'\n';
++  }
++  std::sort(candidates.begin(),candidates.end(),[&](image_t a,image_t b){return scores[a]>scores[b] || (scores[a]==scores[b] && a<b);});
++  return candidates;
+ }
+ 
+ void IncrementalMapper::RegisterInitialImagePair(
