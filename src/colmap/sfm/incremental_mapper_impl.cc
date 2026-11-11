@@ -36,6 +36,7 @@
 #include "colmap/util/hash_containers.h"
 #include "colmap/util/threading.h"
 
+#include <algorithm>
 #include <array>
 
 namespace colmap {
@@ -247,9 +248,29 @@ IncrementalMapperImpl::FindInitialImagePair(
                   reconstruction,
                   num_registrations);
 
+          const auto& first = reconstruction.Image(image_id1);
+          const auto& sensors = first.FramePtr()->RigPtr()->NonRefSensors();
+          const bool same_sensor_seed = !sensors.empty() &&
+              std::all_of(sensors.begin(), sensors.end(), [](const auto& sensor) {
+                return sensor.first.type == SensorType::CAMERA &&
+                       sensor.second.has_value() &&
+                       sensor.second->translation().isZero(1e-12);
+              });
+
           for (const image_t image_id2 : image_ids2) {
             if (stop.load()) {
               return std::nullopt;
+            }
+
+            // A co-central multi-view rig needs inter-frame parallax,
+            // and a same-sensor seed retains a larger common image field.
+            if (same_sensor_seed) {
+              const auto& first = reconstruction.Image(image_id1);
+              const auto& second = reconstruction.Image(image_id2);
+              if (first.CameraId() != second.CameraId() ||
+                  first.FrameId() == second.FrameId()) {
+                continue;
+              }
             }
 
             const image_pair_t pair_id =

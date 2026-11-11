@@ -44,6 +44,7 @@
 #include "colmap/util/hash_containers.h"
 
 #include <array>
+#include "recovery_trace.h"
 
 namespace colmap {
 namespace {
@@ -1135,6 +1136,9 @@ IncrementalMapper::AdjustLocalBundle(
     auto bundle_adjuster =
         CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
     diagnostic_trace::Capture("before_local_BA",*reconstruction_);
+    if (diagnostic_trace::Enabled() && reconstruction_->NumRegFrames() <= 8) {
+      recovery_trace::RecordAnchors(*bundle_adjuster, *reconstruction_);
+    }
     const auto summary = bundle_adjuster->Solve();
     diagnostic_trace::Capture("after_local_BA_before_tracks",*reconstruction_);
 

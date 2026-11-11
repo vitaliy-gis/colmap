@@ -118,7 +118,11 @@ bool GlobalDue(bool native_due,size_t frames) {
 void Capture(const std::string& stage,const Reconstruction& rec,bool full) {
   if(!Enabled())return;
   const bool initial=rec.NumRegFrames()==2 && (stage=="after_initial_pair_registration" || stage=="before_global_BA_solve" || stage=="after_global_BA_solve" || stage=="after_global_normalize");
-  const bool boundary=initial || stage=="resumed_initial" || stage=="before_registration_trial" || stage=="after_registration" || stage=="after_local_refinement" || stage=="before_global_pipeline" || stage=="after_global_pipeline";
+  const bool early_solve = rec.NumRegFrames() <= 8 &&
+      (stage == "before_local_BA" || stage == "after_local_BA_before_tracks");
+  const bool early_model = rec.NumRegFrames() == 3 &&
+      (stage == "after_registration" || early_solve);
+  const bool boundary=early_solve || initial || stage=="resumed_initial" || stage=="before_registration_trial" || stage=="after_registration" || stage=="after_local_refinement" || stage=="before_global_pipeline" || stage=="after_global_pipeline";
   if(!boundary)return;
   auto& s=Get();const auto path=NextFile(stage,"json");
   struct Row {int a,b;size_t checked=0,bad=0;};
@@ -174,7 +178,7 @@ void Capture(const std::string& stage,const Reconstruction& rec,bool full) {
   }
   // First completed global checkpoint only; final CLI model is written separately.
   const bool initial_full=initial && s.initial_snapshots<6;
-  full=full && (initial_full || (stage=="after_global_pipeline" && s.completed_globals==1) || s.stop);
+  full=full && (early_model || initial_full || (stage=="after_global_pipeline" && s.completed_globals==1) || s.stop);
   if(full && initial_full)++s.initial_snapshots;
   std::string model;
   if(full) {
