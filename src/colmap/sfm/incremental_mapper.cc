@@ -28,6 +28,8 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "colmap/sfm/incremental_mapper.h"
+#define COLMAP_DIAGNOSTIC_TRACE_IMPLEMENTATION
+#include "colmap/sfm/diagnostic_trace.h"
 
 #include "colmap/estimators/bundle_adjustment.h"
 #include "colmap/estimators/bundle_adjustment_ceres.h"
@@ -35,6 +37,9 @@
 #include "colmap/estimators/pose.h"
 #include "colmap/estimators/triangulation.h"
 #include "colmap/scene/reconstruction_pruning.h"
+#include "colmap/scene/correspondence_graph.h"
+#include <algorithm>
+#include <cmath>
 #include "colmap/sfm/incremental_mapper_impl.h"
 #include "colmap/util/hash_containers.h"
 
@@ -130,6 +135,7 @@ void IncrementalMapper::BeginReconstruction(
   filtered_frames_.clear();
   reg_stats_.num_reg_trials.clear();
   reg_stats_.num_structure_less_reg_trials.clear();
+  for(const auto& entry : diagnostic_trace::PriorTrials()) reg_stats_.num_reg_trials[entry.first]=entry.second;
 }
 
 void IncrementalMapper::EndReconstruction(const bool discard) {
@@ -181,7 +187,7 @@ bool IncrementalMapper::FindInitialImagePair(const Options& options,
 
 std::vector<image_t> IncrementalMapper::FindNextImages(const Options& options,
                                                        bool structure_less) {
-  return IncrementalMapperImpl::FindNextImages(
+  auto candidates = IncrementalMapperImpl::FindNextImages(
       options,
       *obs_manager_,
       filtered_frames_,
@@ -189,6 +195,38 @@ std::vector<image_t> IncrementalMapper::FindNextImages(const Options& options,
       structure_less ? reg_stats_.num_structure_less_reg_trials
                      : reg_stats_.num_reg_trials,
       /*structure_less=*/structure_less);
+  if (structure_less) return candidates;
+  const auto& graph = *database_cache_->CorrespondenceGraph();
+  const auto& rec = *reconstruction_;
+  std::map<image_t,double> scores;
+  std::ofstream log;
+  if (diagnostic_trace::Enabled()) {
+    log.open(diagnostic_trace::NextFile("aam_ranking", "csv"));
+    log << std::setprecision(17)
+        << "native_rank,image_id,name,max_aam,best_source\n";
+  }
+  for(size_t rank=0;rank<candidates.size();++rank) {
+    const auto id=candidates[rank];const auto& im=rec.Image(id);
+    std::map<image_t,double> by_source;
+    for(point2D_t k=0;k<im.NumPoints2D();++k) {
+      auto a=graph.FindCorrespondences(id,k);
+      for(auto c=a.beg;c<a.end;++c) {
+        const auto& si=rec.Image(c->image_id);if(!si.HasPose())continue;
+        auto b=graph.FindCorrespondences(c->image_id,c->point2D_idx);
+        const size_t degree=im.Name()<si.Name()?size_t(a.end-a.beg):size_t(b.end-b.beg);
+        by_source[c->image_id]+=std::pow(.5,double(degree)-1);
+      }
+    }
+    float best=1e30;image_t best_source=kInvalidImageId;
+    for(auto [sid,v]:by_source){float delta=float(1/(v+1e-6));if(delta<best){best=delta;best_source=sid;}}
+    scores[id]=1.0/best;
+    if (log.is_open()) {
+      log << rank << ',' << id << ',' << im.Name() << ',' << scores[id]
+          << ',' << best_source << '\n';
+    }
+  }
+  std::sort(candidates.begin(),candidates.end(),[&](image_t a,image_t b){return scores[a]>scores[b] || (scores[a]==scores[b] && a<b);});
+  return candidates;
 }
 
 void IncrementalMapper::RegisterInitialImagePair(
@@ -228,6 +266,7 @@ void IncrementalMapper::RegisterInitialImagePair(
   RegisterFrameEvent(image1.FrameId());
   obs_manager_->RegisterFrame(image2.FrameId());
   RegisterFrameEvent(image2.FrameId());
+  diagnostic_trace::Capture("after_initial_pair_registration",*reconstruction_);
 }
 
 bool IncrementalMapper::RegisterNextImage(const Options& options,
@@ -605,6 +644,7 @@ bool IncrementalMapper::RegisterNextGeneralFrame(const Options& options,
   size_t num_inliers;
   std::vector<char> inlier_mask;
   Rigid3d rig_from_world;
+  diagnostic_trace::PnP("pnp_input",tri_corrs,tri_points2D,tri_points3D,tri_camera_idxs,cams_from_rig,inlier_mask,nullptr);
   if (!EstimateGeneralizedAbsolutePose(abs_pose_options,
                                        tri_points2D,
                                        tri_points3D,
@@ -628,6 +668,7 @@ bool IncrementalMapper::RegisterNextGeneralFrame(const Options& options,
   // Pose refinement
   //////////////////////////////////////////////////////////////////////////////
 
+  diagnostic_trace::PnP("pnp_estimated",tri_corrs,tri_points2D,tri_points3D,tri_camera_idxs,cams_from_rig,inlier_mask,&rig_from_world);
   if (!RefineGeneralizedAbsolutePose(abs_pose_refinement_options,
                                      inlier_mask,
                                      tri_points2D,
@@ -647,6 +688,7 @@ bool IncrementalMapper::RegisterNextGeneralFrame(const Options& options,
   VLOG(2) << "Continuing tracks for " << num_inliers
           << " inlier 2D-3D correspondences";
 
+  diagnostic_trace::PnP("pnp_refined",tri_corrs,tri_points2D,tri_points3D,tri_camera_idxs,cams_from_rig,inlier_mask,&rig_from_world);
   frame.SetRigFromWorld(rig_from_world);
 
   obs_manager_->RegisterFrame(frame.FrameId());
@@ -1081,10 +1123,20 @@ IncrementalMapper::AdjustLocalBundle(
 
     // Adjust the local bundle.
     image_ids = ba_config.Images();
+    if(diagnostic_trace::Enabled()) {
+      std::ofstream f(diagnostic_trace::NextFile("local_bundle_config","json"));
+      f << "{\"trigger_image\":" << diagnostic_trace::CurrentImage() << ",\"images\":[";
+      bool first=true; for(const image_t id:ba_config.Images()) {if(!first)f<<',';first=false;f<<id;}
+      f << "],\"frames\":[";first=true;for(const frame_t id:frame_ids){if(!first)f<<',';first=false;f<<id;}
+      f << "],\"variable_points\":" << variable_point3D_ids.size() << "}\n";
+    }
+
 
     auto bundle_adjuster =
         CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
+    diagnostic_trace::Capture("before_local_BA",*reconstruction_);
     const auto summary = bundle_adjuster->Solve();
+    diagnostic_trace::Capture("after_local_BA_before_tracks",*reconstruction_);
 
     report.num_adjusted_observations = summary->num_residuals / 2;
 
@@ -1138,7 +1190,9 @@ bool IncrementalMapper::AdjustGlobalBundle(
   }
 
   // Avoid degeneracies in bundle adjustment.
+  diagnostic_trace::Capture("before_negative_depth_filter",*reconstruction_);
   obs_manager_->FilterObservationsWithNegativeDepth();
+  diagnostic_trace::Capture("after_negative_depth_filter",*reconstruction_);
 
   // Configure bundle adjustment.
   BundleAdjustmentConfig ba_config;
@@ -1249,7 +1303,10 @@ bool IncrementalMapper::AdjustGlobalBundle(
         CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
   }
 
-  return bundle_adjuster->Solve()->IsSolutionUsable();
+  diagnostic_trace::Capture("before_global_BA_solve",*reconstruction_);
+  const bool trace_usable=bundle_adjuster->Solve()->IsSolutionUsable();
+  diagnostic_trace::Capture("after_global_BA_solve",*reconstruction_);
+  return trace_usable;
 }
 
 void IncrementalMapper::IterativeLocalRefinement(
@@ -1304,8 +1361,11 @@ void IncrementalMapper::IterativeGlobalRefinement(
   if (ba_options.check_if_stopped && ba_options.check_if_stopped()) {
     return;
   }
+  diagnostic_trace::Capture("before_global_complete_merge",*reconstruction_);
   CompleteAndMergeTracks(tri_options);
+  diagnostic_trace::Capture("after_global_complete_merge",*reconstruction_);
   const size_t num_retriangulated_observations = Retriangulate(tri_options);
+  diagnostic_trace::Capture("after_global_retriangulate",*reconstruction_);
   VLOG(1) << "=> Retriangulated observations: "
           << num_retriangulated_observations;
   for (int i = 0; i < max_num_refinements; ++i) {
@@ -1320,10 +1380,14 @@ void IncrementalMapper::IterativeGlobalRefinement(
     if (normalize_reconstruction && !options.use_prior_position) {
       // Normalize scene for numerical stability and
       // to avoid large scale changes in the viewer.
+      diagnostic_trace::Capture("before_global_normalize",*reconstruction_);
       reconstruction_->Normalize();
+      diagnostic_trace::Capture("after_global_normalize",*reconstruction_);
     }
     size_t num_changed_observations = CompleteAndMergeTracks(tri_options);
+    diagnostic_trace::Capture("after_global_postsolve_tracks",*reconstruction_);
     num_changed_observations += FilterPoints(options);
+    diagnostic_trace::Capture("after_global_point_filter",*reconstruction_);
     const double changed =
         num_observations == 0
             ? 0

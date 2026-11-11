@@ -40,6 +40,7 @@
 #include "colmap/util/threading.h"
 
 #include <iomanip>
+#include "colmap/estimators/physical_rig.h"
 
 namespace colmap {
 
@@ -640,6 +641,9 @@ class DefaultBundleAdjuster : public CeresBundleAdjuster {
     // Verify that reconstruction is internally consistent.
     THROW_CHECK(reconstruction.IsValid());
 
+    physical_reconstruction_ = &reconstruction;
+    physical_rig_.Initialize(reconstruction, config_, options_);
+
     // Set up problem.
     // Warning: AddPointsToProblem assumes that AddImageToProblem is called
     // first. Do not change order of instructions!
@@ -660,6 +664,7 @@ class DefaultBundleAdjuster : public CeresBundleAdjuster {
                         *problem_);
     ParameterizeRigsAndFrames(
         options_, config_, parameterized_image_ids_, reconstruction, *problem_);
+    physical_rig_.Parameterize(*problem_);
     ParameterizePoints(options_,
                        config_,
                        point3D_num_observations_,
@@ -698,6 +703,7 @@ class DefaultBundleAdjuster : public CeresBundleAdjuster {
       PrintSolverSummary(ceres_summary, "Bundle adjustment report");
     }
 
+    physical_rig_.Synchronize(*physical_reconstruction_);
     return CreateSummaryAndLogFailure(std::move(ceres_summary),
                                       "Bundle adjustment");
   }
@@ -816,7 +822,13 @@ class DefaultBundleAdjuster : public CeresBundleAdjuster {
 
       // The !constant_sensor_from_rig && constant_rig_from_world is
       // rare enough that we do not have a specialized cost function for it.
-      if (constant_sensor_from_rig && constant_rig_from_world) {
+      if (physical_rig_.rig && physical_rig_.slots.at(image.CameraId()).lens == 1) {
+        THROW_CHECK(camera.model_id == PinholeCameraModel::model_id);
+        problem_->AddResidualBlock(
+            PhysicalRigReprojError::Create(point2D.xy, physical_rig_.slots.at(image.CameraId()).view_from_lens),
+            loss_function_.get(), point3D.xyz.data(), physical_rig_.B().params.data(),
+            rig_from_world.params.data(), camera.params.data());
+      } else if (constant_sensor_from_rig && constant_rig_from_world) {
         problem_->AddResidualBlock(
             CreateCameraCostFunction<ReprojErrorConstantPoseCostFunctor>(
                 camera.model_id, point2D.xy, cam_from_world.value()),
@@ -912,6 +924,8 @@ class DefaultBundleAdjuster : public CeresBundleAdjuster {
   }
 
  private:
+  PhysicalRigState physical_rig_;
+  Reconstruction* physical_reconstruction_ = nullptr;
   std::shared_ptr<ceres::Problem> problem_;
   std::unique_ptr<ceres::LossFunction> loss_function_;
 

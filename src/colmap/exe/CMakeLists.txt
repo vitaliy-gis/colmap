@@ -127,3 +127,12 @@ if(HIP_ENABLED)
     target_link_libraries(colmap_main hip::host hip::hiprand roc::rocrand)
 endif()
 set_target_properties(colmap_main PROPERTIES OUTPUT_NAME colmap)
+
+COLMAP_ADD_EXECUTABLE(
+    NAME pano_aam_mapper
+    SRCS pano_aam_main.cc
+    LINK_LIBS
+        colmap_exe
+        SQLite3::SQLite3
+        ${OPTIONAL_LIBS}
+)

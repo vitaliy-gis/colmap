@@ -28,6 +28,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "colmap/controllers/incremental_pipeline.h"
+#include "colmap/sfm/diagnostic_trace.h"
 
 #include "colmap/estimators/alignment.h"
 #include "colmap/estimators/bundle_adjustment_caspar.h"
@@ -416,7 +417,7 @@ void IncrementalPipeline::Run() {
   }
 
   auto ShouldStop = [this, &mapper, &num_images]() {
-    return mapper.NumTotalRegImages() == num_images || CheckIfStopped() ||
+    return mapper.NumTotalRegImages() == num_images || (CheckIfStopped() || diagnostic_trace::StopRequested()) ||
            CheckReachedMaxRuntime();
   };
 
@@ -465,7 +466,7 @@ IncrementalPipeline::Status IncrementalPipeline::InitializeReconstruction(
     LOG(INFO) << "Finding good initial image pair";
     const bool find_init_success = mapper.FindInitialImagePair(
         mapper_options, image_id1, image_id2, cam2_from_cam1);
-    if (CheckIfStopped() || CheckReachedMaxRuntime()) {
+    if ((CheckIfStopped() || diagnostic_trace::StopRequested()) || CheckReachedMaxRuntime()) {
       return Status::INTERRUPTED;
     }
     if (!find_init_success) {
@@ -509,9 +510,9 @@ IncrementalPipeline::Status IncrementalPipeline::InitializeReconstruction(
 
   LOG(INFO) << "Global bundle adjustment";
   BundleAdjustmentOptions ba_options = options_->GlobalBundleAdjustment();
-  ba_options.check_if_stopped = [this]() { return CheckIfStopped(); };
+  ba_options.check_if_stopped = [this]() { return (CheckIfStopped() || diagnostic_trace::StopRequested()); };
   mapper.AdjustGlobalBundle(mapper_options, ba_options);
-  if (CheckIfStopped() || CheckReachedMaxRuntime()) {
+  if ((CheckIfStopped() || diagnostic_trace::StopRequested()) || CheckReachedMaxRuntime()) {
     return Status::INTERRUPTED;
   }
   reconstruction.Normalize();
@@ -559,6 +560,8 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
     const IncrementalMapper::Options& mapper_options,
     const std::shared_ptr<Reconstruction>& reconstruction) {
   mapper.BeginReconstruction(reconstruction);
+  diagnostic_trace::Capture("resumed_initial",*reconstruction);
+  if(diagnostic_trace::StopRequested())return Status::INTERRUPTED;
 
   if (HasUnknownSensorFromRig(*reconstruction)) {
     return Status::UNKNOWN_SENSOR_FROM_RIG;
@@ -584,6 +587,8 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
   size_t snapshot_prev_num_reg_frames = reconstruction->NumRegFrames();
   size_t ba_prev_num_reg_frames = reconstruction->NumRegFrames();
   size_t ba_prev_num_points = reconstruction->NumPoints3D();
+  if(const char* value=std::getenv("COLMAP_DIAGNOSTIC_BA_PREV_FRAMES")) ba_prev_num_reg_frames=std::stoull(value);
+  if(const char* value=std::getenv("COLMAP_DIAGNOSTIC_BA_PREV_POINTS")) ba_prev_num_points=std::stoull(value);
 
   std::vector<bool> structure_less_flags;
   if (options_->structure_less_registration_only) {
@@ -599,7 +604,7 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
   bool reg_next_success = true;
   bool prev_reg_next_success = true;
   do {
-    if (CheckIfStopped() || CheckReachedMaxRuntime()) {
+    if ((CheckIfStopped() || diagnostic_trace::StopRequested()) || CheckReachedMaxRuntime()) {
       break;
     }
 
@@ -625,6 +630,9 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
             mapper.ObservationManager().NumVisiblePoints3D(next_image_id),
             mapper.ObservationManager().NumObservations(next_image_id));
 
+        diagnostic_trace::SetImage(next_image_id);
+        diagnostic_trace::Capture("before_registration_trial",*reconstruction);
+        if(diagnostic_trace::StopRequested())return Status::INTERRUPTED;
         if (structure_less) {
           LOG(INFO) << StringPrintf(
               "Registering image with structure-less fallback");
@@ -662,29 +670,36 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
     }
 
     if (reg_next_success) {
+      diagnostic_trace::Capture("after_registration",*reconstruction);
+      if(diagnostic_trace::StopRequested())return Status::INTERRUPTED;
       const Image& image = reconstruction->Image(next_image_id);
       for (const data_t& data_id : image.FramePtr()->ImageIds()) {
         mapper.TriangulateImage(options_->Triangulation(), data_id.id);
       }
+      diagnostic_trace::Capture("after_frame_triangulation",*reconstruction);
+      if(diagnostic_trace::StopRequested())return Status::INTERRUPTED;
       BundleAdjustmentOptions ba_options = options_->LocalBundleAdjustment();
-      ba_options.check_if_stopped = [this]() { return CheckIfStopped(); };
+      ba_options.check_if_stopped = [this]() { return (CheckIfStopped() || diagnostic_trace::StopRequested()); };
       mapper.IterativeLocalRefinement(options_->ba_local_max_refinements,
                                       options_->ba_local_max_refinement_change,
                                       mapper_options,
                                       ba_options,
                                       options_->Triangulation(),
                                       next_image_id);
+      diagnostic_trace::Capture("after_local_refinement",*reconstruction);
 
-      if (CheckIfStopped() || CheckReachedMaxRuntime()) {
+      if ((CheckIfStopped() || diagnostic_trace::StopRequested()) || CheckReachedMaxRuntime()) {
         break;
       }
 
-      if (CheckRunGlobalRefinement(
-              *reconstruction, ba_prev_num_reg_frames, ba_prev_num_points)) {
+      if (diagnostic_trace::GlobalDue(CheckRunGlobalRefinement(
+              *reconstruction, ba_prev_num_reg_frames, ba_prev_num_points), reconstruction->NumRegFrames())) {
+        diagnostic_trace::Capture("before_global_pipeline",*reconstruction);
         IterativeGlobalRefinement(*options_, mapper_options, mapper, [this]() {
-          return CheckIfStopped();
+          return (CheckIfStopped() || diagnostic_trace::StopRequested());
         });
-        if (CheckIfStopped() || CheckReachedMaxRuntime()) {
+        diagnostic_trace::Capture("after_global_pipeline",*reconstruction);
+        if ((CheckIfStopped() || diagnostic_trace::StopRequested()) || CheckReachedMaxRuntime()) {
           break;
         }
         ba_prev_num_points = reconstruction->NumPoints3D();
@@ -718,12 +733,12 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
     // once, then exit the incremental mapping.
     if (!reg_next_success && prev_reg_next_success) {
       IterativeGlobalRefinement(*options_, mapper_options, mapper, [this]() {
-        return CheckIfStopped();
+        return (CheckIfStopped() || diagnostic_trace::StopRequested());
       });
     }
   } while (reg_next_success || prev_reg_next_success);
 
-  if (CheckIfStopped() || CheckReachedMaxRuntime()) {
+  if ((CheckIfStopped() || diagnostic_trace::StopRequested()) || CheckReachedMaxRuntime()) {
     return Status::INTERRUPTED;
   }
 
@@ -732,7 +747,7 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
       reconstruction->NumRegFrames() != ba_prev_num_reg_frames &&
       reconstruction->NumPoints3D() != ba_prev_num_points) {
     IterativeGlobalRefinement(*options_, mapper_options, mapper, [this]() {
-      return CheckIfStopped();
+      return (CheckIfStopped() || diagnostic_trace::StopRequested());
     });
   }
   return Status::SUCCESS;
@@ -744,7 +759,7 @@ IncrementalPipeline::Status IncrementalPipeline::Reconstruct(
     bool continue_reconstruction) {
   for (int num_trials = 0; num_trials < options_->init_num_trials;
        ++num_trials) {
-    if (CheckIfStopped() || CheckReachedMaxRuntime()) {
+    if ((CheckIfStopped() || diagnostic_trace::StopRequested()) || CheckReachedMaxRuntime()) {
       return Status::STOP;
     }
 
@@ -862,7 +877,7 @@ void IncrementalPipeline::TriangulateReconstruction(
   LOG(INFO) << "Iterative triangulation";
   size_t image_idx = 0;
   for (const image_t image_id : reconstruction->RegImageIds()) {
-    if (CheckIfStopped()) {
+    if ((CheckIfStopped() || diagnostic_trace::StopRequested())) {
       break;
     }
     const auto& image = reconstruction->Image(image_id);
@@ -879,10 +894,10 @@ void IncrementalPipeline::TriangulateReconstruction(
             << (image.NumPoints3D() - num_existing_points3D) << " points";
   }
 
-  if (!CheckIfStopped()) {
+  if (!(CheckIfStopped() || diagnostic_trace::StopRequested())) {
     LOG(INFO) << "Retriangulation and Global bundle adjustment";
     BundleAdjustmentOptions ba_options = options_->GlobalBundleAdjustment();
-    ba_options.check_if_stopped = [this]() { return CheckIfStopped(); };
+    ba_options.check_if_stopped = [this]() { return (CheckIfStopped() || diagnostic_trace::StopRequested()); };
     mapper.IterativeGlobalRefinement(options_->ba_global_max_refinements,
                                      options_->ba_global_max_refinement_change,
                                      options_->Mapper(),
@@ -894,7 +909,7 @@ void IncrementalPipeline::TriangulateReconstruction(
 
   reconstruction->UpdatePoint3DErrors();
 
-  if (!CheckIfStopped()) {
+  if (!(CheckIfStopped() || diagnostic_trace::StopRequested())) {
     LOG(INFO) << "Extracting colors";
     reconstruction->ExtractColorsForAllImages(options_->image_path,
                                               options_->num_threads);
