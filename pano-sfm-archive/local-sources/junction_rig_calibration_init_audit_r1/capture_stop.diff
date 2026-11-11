@@ -1,0 +1,11 @@
+--- 
++++ 
+@@ -141,7 +141,7 @@
+   if(!s.initialized) {s.baseline_bad=strong;s.initialized=true;
+     if(!strong.empty()){s.stop=true;s.reason="baseline_conflict";}}
+   for(const auto& p:strong)if(!s.baseline_bad.count(p)) {s.stop=true;s.reason="new_signed_translation_conflict";}
+-  if(rec.NumRegFrames()>=s.max_frames && !s.stop) {s.stop=true;s.reason="bounded_frame_limit";}
++  if((stage=="after_initial_filter" || (stage=="after_initial_triangulation" && rec.NumPoints3D()==0)) && !s.stop) {s.stop=true;s.reason="bounded_frame_limit";}
+   if(full && s.snapshots>=s.max_snapshots) {full=false;s.stop=true;s.reason="snapshot_budget";}
+   if(std::filesystem::space(s.root).available<120ull*1024*1024*1024) {
+     full=false;s.stop=true;s.reason="disk_reserve";

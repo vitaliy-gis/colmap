@@ -1,0 +1,11 @@
+--- 
++++ 
+@@ -587,6 +587,8 @@
+   size_t snapshot_prev_num_reg_frames = reconstruction->NumRegFrames();
+   size_t ba_prev_num_reg_frames = reconstruction->NumRegFrames();
+   size_t ba_prev_num_points = reconstruction->NumPoints3D();
++  if(const char* value=std::getenv("COLMAP_DIAGNOSTIC_BA_PREV_FRAMES")) ba_prev_num_reg_frames=std::stoull(value);
++  if(const char* value=std::getenv("COLMAP_DIAGNOSTIC_BA_PREV_POINTS")) ba_prev_num_points=std::stoull(value);
+ 
+   std::vector<bool> structure_less_flags;
+   if (options_->structure_less_registration_only) {

@@ -1,0 +1,39 @@
+--- A_B/solve.cc
++++ C/solve.cc
+@@ -37,7 +37,8 @@
+     THROW_CHECK(observations.emplace(image, index, point).second);
+   }
+   THROW_CHECK(in.eof());
+-  THROW_CHECK_EQ(observations.size(), 6974);
++  THROW_CHECK_GT(observations.size(), 0);
++  THROW_CHECK_LT(observations.size(), 6974);
+   return observations;
+ }
+ 
+@@ -172,7 +173,7 @@
+     log << image << ' ' << index << ' ' << point << '\n';
+     if (remove) problem.RemoveResidualBlock(block);
+   }
+-  THROW_CHECK_EQ(problem.NumResidualBlocks(), 483121 - (remove ? 6974 : 0));
++  THROW_CHECK_EQ(problem.NumResidualBlocks(), 483121 - (remove ? target.size() : 0));
+   THROW_CHECK_EQ(problem.NumResiduals(), 2 * problem.NumResidualBlocks());
+   for (const auto& [address, id] : points) {
+     THROW_CHECK(problem.HasParameterBlock(address));
+@@ -198,7 +199,7 @@
+   InitializeGlog(argv);
+   THROW_CHECK_GE(argc, 6);
+   const std::string branch = argv[1];
+-  THROW_CHECK(branch == "A" || branch == "B");
++  THROW_CHECK(branch == "C");
+   const std::filesystem::path input(argv[2]), out(argv[3]);
+   THROW_CHECK(std::getenv("COLMAP_PHYSICAL_RIG_CONFIG") == nullptr);
+   std::vector<char*> option_argv{argv[0]};
+@@ -240,7 +241,7 @@
+   THROW_CHECK_NOTNULL(ceres_adjuster);
+   auto& problem = *ceres_adjuster->Problem();
+   WriteGauge(out / "gauge_full.csv", model, problem);
+-  ApplyTreatment(target, out, branch == "B", model, problem);
++  ApplyTreatment(target, out, true, model, problem);
+   WriteGauge(out / "gauge_used.csv", model, problem);
+   const auto summary = adjuster->Solve();
+   const auto* result = dynamic_cast<const CeresBundleAdjustmentSummary*>(summary.get());

@@ -1,0 +1,84 @@
+--- incremental_mapper_impl.cc
++++ incremental_mapper_impl.cc
+@@ -36,6 +36,7 @@
+ #include "colmap/util/hash_containers.h"
+ #include "colmap/util/threading.h"
+ 
++#include <algorithm>
+ #include <array>
+ 
+ namespace colmap {
+@@ -247,9 +248,29 @@
+                   reconstruction,
+                   num_registrations);
+ 
++          const auto& first = reconstruction.Image(image_id1);
++          const auto& sensors = first.FramePtr()->RigPtr()->NonRefSensors();
++          const bool same_sensor_seed = !sensors.empty() &&
++              std::all_of(sensors.begin(), sensors.end(), [](const auto& sensor) {
++                return sensor.first.type == SensorType::CAMERA &&
++                       sensor.second.has_value() &&
++                       sensor.second->translation().isZero(1e-12);
++              });
++
+           for (const image_t image_id2 : image_ids2) {
+             if (stop.load()) {
+               return std::nullopt;
++            }
++
++            // A co-central multi-view rig needs inter-frame parallax,
++            // and a same-sensor seed retains a larger common image field.
++            if (same_sensor_seed) {
++              const auto& first = reconstruction.Image(image_id1);
++              const auto& second = reconstruction.Image(image_id2);
++              if (first.CameraId() != second.CameraId() ||
++                  first.FrameId() == second.FrameId()) {
++                continue;
++              }
+             }
+ 
+             const image_pair_t pair_id =
+--- diagnostic_trace.h
++++ diagnostic_trace.h
+@@ -118,7 +118,11 @@
+ void Capture(const std::string& stage,const Reconstruction& rec,bool full) {
+   if(!Enabled())return;
+   const bool initial=rec.NumRegFrames()==2 && (stage=="after_initial_pair_registration" || stage=="before_global_BA_solve" || stage=="after_global_BA_solve" || stage=="after_global_normalize");
+-  const bool boundary=initial || stage=="resumed_initial" || stage=="before_registration_trial" || stage=="after_registration" || stage=="after_local_refinement" || stage=="before_global_pipeline" || stage=="after_global_pipeline";
++  const bool early_solve = rec.NumRegFrames() <= 8 &&
++      (stage == "before_local_BA" || stage == "after_local_BA_before_tracks");
++  const bool early_model = rec.NumRegFrames() == 3 &&
++      (stage == "after_registration" || early_solve);
++  const bool boundary=early_solve || initial || stage=="resumed_initial" || stage=="before_registration_trial" || stage=="after_registration" || stage=="after_local_refinement" || stage=="before_global_pipeline" || stage=="after_global_pipeline";
+   if(!boundary)return;
+   auto& s=Get();const auto path=NextFile(stage,"json");
+   struct Row {int a,b;size_t checked=0,bad=0;};
+@@ -174,7 +178,7 @@
+   }
+   // First completed global checkpoint only; final CLI model is written separately.
+   const bool initial_full=initial && s.initial_snapshots<6;
+-  full=full && (initial_full || (stage=="after_global_pipeline" && s.completed_globals==1) || s.stop);
++  full=full && (early_model || initial_full || (stage=="after_global_pipeline" && s.completed_globals==1) || s.stop);
+   if(full && initial_full)++s.initial_snapshots;
+   std::string model;
+   if(full) {
+--- incremental_mapper.cc
++++ incremental_mapper.cc
+@@ -44,6 +44,7 @@
+ #include "colmap/util/hash_containers.h"
+ 
+ #include <array>
++#include "recovery_trace.h"
+ 
+ namespace colmap {
+ namespace {
+@@ -1128,6 +1129,9 @@
+     auto bundle_adjuster =
+         CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
+     diagnostic_trace::Capture("before_local_BA",*reconstruction_);
++    if (diagnostic_trace::Enabled() && reconstruction_->NumRegFrames() <= 8) {
++      recovery_trace::RecordAnchors(*bundle_adjuster, *reconstruction_);
++    }
+     const auto summary = bundle_adjuster->Solve();
+     diagnostic_trace::Capture("after_local_BA_before_tracks",*reconstruction_);
+ 
