@@ -30,6 +30,8 @@
 #include "colmap/sfm/incremental_mapper.h"
 #define COLMAP_DIAGNOSTIC_TRACE_IMPLEMENTATION
 #include "colmap/sfm/diagnostic_trace.h"
+#include "terminal_trace.h"
+#include "terminal_admission.h"
 
 #include "colmap/estimators/bundle_adjustment.h"
 #include "colmap/estimators/bundle_adjustment_ceres.h"
@@ -1191,8 +1193,10 @@ bool IncrementalMapper::AdjustGlobalBundle(
 
   // Avoid degeneracies in bundle adjustment.
   diagnostic_trace::Capture("before_negative_depth_filter",*reconstruction_);
+  terminal_trace::Capture("before_negative_depth_filter",*reconstruction_);
   obs_manager_->FilterObservationsWithNegativeDepth();
   diagnostic_trace::Capture("after_negative_depth_filter",*reconstruction_);
+  terminal_trace::Capture("after_negative_depth_filter",*reconstruction_);
 
   // Configure bundle adjustment.
   BundleAdjustmentConfig ba_config;
@@ -1304,7 +1308,13 @@ bool IncrementalMapper::AdjustGlobalBundle(
   }
 
   diagnostic_trace::Capture("before_global_BA_solve",*reconstruction_);
-  const bool trace_usable=bundle_adjuster->Solve()->IsSolutionUsable();
+  terminal_trace::Capture("before_global_BA_solve",*reconstruction_);
+  bool trace_usable;
+  {
+    const auto summary = bundle_adjuster->Solve();
+    trace_usable = summary->IsSolutionUsable();
+    terminal_trace::CaptureSolve(*reconstruction_, *summary, trace_usable);
+  }
   diagnostic_trace::Capture("after_global_BA_solve",*reconstruction_);
   return trace_usable;
 }
@@ -1362,10 +1372,17 @@ void IncrementalMapper::IterativeGlobalRefinement(
     return;
   }
   diagnostic_trace::Capture("before_global_complete_merge",*reconstruction_);
+  terminal_trace::Capture("before_global_complete_merge",*reconstruction_);
+  const auto before_complete = terminal_admission::Before(*reconstruction_);
   CompleteAndMergeTracks(tri_options);
+  terminal_admission::Apply("initial_complete_merge", before_complete, *reconstruction_, *obs_manager_, *triangulator_);
   diagnostic_trace::Capture("after_global_complete_merge",*reconstruction_);
+  terminal_trace::Capture("after_global_complete_merge",*reconstruction_);
+  const auto before_retriangulate = terminal_admission::Before(*reconstruction_);
   const size_t num_retriangulated_observations = Retriangulate(tri_options);
+  terminal_admission::Apply("retriangulate", before_retriangulate, *reconstruction_, *obs_manager_, *triangulator_);
   diagnostic_trace::Capture("after_global_retriangulate",*reconstruction_);
+  terminal_trace::Capture("after_global_retriangulate",*reconstruction_);
   VLOG(1) << "=> Retriangulated observations: "
           << num_retriangulated_observations;
   for (int i = 0; i < max_num_refinements; ++i) {
@@ -1381,13 +1398,25 @@ void IncrementalMapper::IterativeGlobalRefinement(
       // Normalize scene for numerical stability and
       // to avoid large scale changes in the viewer.
       diagnostic_trace::Capture("before_global_normalize",*reconstruction_);
-      reconstruction_->Normalize();
+      terminal_trace::Capture("before_global_normalize",*reconstruction_);
+      const auto normalization = reconstruction_->Normalize();
       diagnostic_trace::Capture("after_global_normalize",*reconstruction_);
+      const auto path = terminal_trace::Capture("after_global_normalize", *reconstruction_);
+      if (!path.empty()) {
+        std::ofstream transform(path / "normalization.txt");
+        transform.exceptions(std::ios::failbit | std::ios::badbit);
+        transform << std::setprecision(17) << normalization.ToMatrix() << '\n';
+      }
     }
+    const auto before_postsolve = terminal_admission::Before(*reconstruction_);
     size_t num_changed_observations = CompleteAndMergeTracks(tri_options);
+    num_changed_observations += terminal_admission::Apply(
+        "postsolve_complete_merge", before_postsolve, *reconstruction_, *obs_manager_, *triangulator_);
     diagnostic_trace::Capture("after_global_postsolve_tracks",*reconstruction_);
+    terminal_trace::Capture("after_global_postsolve_tracks",*reconstruction_);
     num_changed_observations += FilterPoints(options);
     diagnostic_trace::Capture("after_global_point_filter",*reconstruction_);
+    terminal_trace::Capture("after_global_point_filter",*reconstruction_);
     const double changed =
         num_observations == 0
             ? 0
@@ -1408,6 +1437,7 @@ size_t IncrementalMapper::FilterFrames(const Options& options) {
   // Do not filter frames in the early stage of the reconstruction, since the
   // calibration is often still refining a lot. Hence, the camera parameters
   // are not stable in the beginning.
+  terminal_trace::Capture("before_global_frame_filter", *reconstruction_);
   const size_t kMinNumFrames = 20;
   if (reconstruction_->NumRegFrames() < kMinNumFrames) {
     return {};
@@ -1432,6 +1462,7 @@ size_t IncrementalMapper::FilterFrames(const Options& options) {
   }
 
   VLOG(1) << "=> Filtered frames: " << num_filtered;
+  terminal_trace::Capture("after_global_frame_filter", *reconstruction_);
   return num_filtered;
 }
 

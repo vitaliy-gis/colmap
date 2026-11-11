@@ -29,6 +29,7 @@
 
 #include "colmap/controllers/incremental_pipeline.h"
 #include "colmap/sfm/diagnostic_trace.h"
+#include "colmap/sfm/terminal_trace.h"
 
 #include "colmap/estimators/alignment.h"
 #include "colmap/estimators/bundle_adjustment_caspar.h"
@@ -695,9 +696,11 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
       if (diagnostic_trace::GlobalDue(CheckRunGlobalRefinement(
               *reconstruction, ba_prev_num_reg_frames, ba_prev_num_points), reconstruction->NumRegFrames())) {
         diagnostic_trace::Capture("before_global_pipeline",*reconstruction);
+        terminal_trace::Block terminal("scheduled", *reconstruction, reconstruction->NumRegFrames() == 665);
         IterativeGlobalRefinement(*options_, mapper_options, mapper, [this]() {
           return (CheckIfStopped() || diagnostic_trace::StopRequested());
         });
+        terminal.Finish(*reconstruction);
         diagnostic_trace::Capture("after_global_pipeline",*reconstruction);
         if ((CheckIfStopped() || diagnostic_trace::StopRequested()) || CheckReachedMaxRuntime()) {
           break;
@@ -732,9 +735,11 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
     // bundle adjustment and try again to register one image. If this fails
     // once, then exit the incremental mapping.
     if (!reg_next_success && prev_reg_next_success) {
+      terminal_trace::Block terminal("exhaustion_retry", *reconstruction);
       IterativeGlobalRefinement(*options_, mapper_options, mapper, [this]() {
         return (CheckIfStopped() || diagnostic_trace::StopRequested());
       });
+      terminal.Finish(*reconstruction);
     }
   } while (reg_next_success || prev_reg_next_success);
 
@@ -746,9 +751,11 @@ IncrementalPipeline::Status IncrementalPipeline::ReconstructSubModel(
   if (reconstruction->NumRegFrames() > 0 &&
       reconstruction->NumRegFrames() != ba_prev_num_reg_frames &&
       reconstruction->NumPoints3D() != ba_prev_num_points) {
+    terminal_trace::Block terminal("final_refinement", *reconstruction);
     IterativeGlobalRefinement(*options_, mapper_options, mapper, [this]() {
       return (CheckIfStopped() || diagnostic_trace::StopRequested());
     });
+    terminal.Finish(*reconstruction);
   }
   return Status::SUCCESS;
 }
@@ -837,11 +844,14 @@ IncrementalPipeline::Status IncrementalPipeline::Reconstruct(
           mapper.EndReconstruction(/*discard=*/true);
           reconstruction_manager_->Delete(reconstruction_idx);
         } else {
+          terminal_trace::Block terminal("success_handoff", *reconstruction);
           reconstruction->UpdatePoint3DErrors();
           LOG(INFO) << "Keeping successful reconstruction";
           mapper.EndReconstruction(/*discard=*/false);
+          terminal_trace::Capture("before_success_alignment", *reconstruction);
           AlignReconstructionToPriorsOrRigScale(
               *options_, *database_cache_, reconstruction.get());
+          terminal.Finish(*reconstruction);
         }
 
         Callback(LAST_IMAGE_REG_CALLBACK);
